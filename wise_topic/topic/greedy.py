@@ -1,14 +1,17 @@
+import asyncio
 from collections import defaultdict
 from copy import deepcopy
 from typing import Optional, Sequence, Callable, Union
 import logging
+import copy
 
 import numpy as np
 from langchain_core.language_models import BaseLanguageModel
 from langchain_openai import ChatOpenAI
 
-from .classifier import topic_classifier
+from .classifier import topic_classifier, topic_classifier_async
 from .topic_extractor import extract_topics
+from ..parallel import process_batch_parallel
 
 
 class GreedyTopicExtractor:
@@ -21,9 +24,11 @@ class GreedyTopicExtractor:
         max_words_in_topic: int = 6,
         initial_topics: Optional[Sequence[str]] = None,
         topic_extractor: Callable = extract_topics,
-        topic_llm: Union[str, BaseLanguageModel] = "gpt-4-turbo",
+        topic_llm: Union[str, BaseLanguageModel] = "gpt-4o",
         classifier: Callable = topic_classifier,
-        classifier_llm: Union[str, BaseLanguageModel] = "gpt-3.5-turbo",
+        classifier_llm: Union[str, BaseLanguageModel] = "gpt-4o-mini",
+        max_parallel_calls: int = 5,
+        extra_prompt: str | None = None,
         verbose: bool = False,
     ):
         """
@@ -46,7 +51,7 @@ class GreedyTopicExtractor:
             if initial_unclassified_messages is None
             else initial_unclassified_messages
         )
-        self.num_topics_per_pass = num_topics_per_update
+        self.num_topics_per_update = num_topics_per_update
         self.initial_num_topics = (
             num_topics_per_update * 2
             if initial_num_topics is None
@@ -61,46 +66,95 @@ class GreedyTopicExtractor:
         if isinstance(classifier_llm, str):
             classifier_llm = ChatOpenAI(model=classifier_llm, temperature=0)
         self.classifier_llm = classifier_llm
+        self.extra_prompt = extra_prompt
         self.verbose = verbose
+        self.max_parallel_calls = max_parallel_calls
 
         self.topics = [] if initial_topics is None else list(initial_topics)
         self.messages_to_topics = {}
         self.unclassified_messages = []
+        self.rename = True
 
     def __call__(self, messages: Sequence[str]):
+        """
+        Processes a list of messages synchronously while allowing up to N simultaneous async classifier calls.
+        Pauses all classify_message calls if topics are being updated or extracted. Handles both cases where
+        an event loop is already running or needs to be created.
+
+        Parameters:
+        - messages (Sequence[str]): The list of messages to classify.
+        - max_concurrent_tasks (int): Maximum number of simultaneous async classifier calls.
+        """
         np.random.shuffle(messages)
-        for i, m in enumerate(messages):
-            self.step(m)
+
+        # Process messages in batches, assigning them to existing topics
+        # if too many messages that don't fit have accumulated, extract more topics from them
+        # and add them to the list
+        for ind in range(0, len(messages), self.max_unclassified_messages):
+            msg = messages[
+                ind : min(ind + self.max_unclassified_messages, len(messages))
+            ]
+            self.process_batch(msg, self.max_parallel_calls)
+
+            # Check if topics need to be updated
+            update_topics = False
+            if len(self.topics):
+                if len(self.unclassified_messages) > self.max_unclassified_messages:
+                    update_topics = True
+            else:
+                if len(self.unclassified_messages) > self.initial_unclassified_messages:
+                    update_topics = True
+                elif len(messages) - ind < self.max_unclassified_messages:
+
+                    # we're done and there were not sufficient messages in total to trigger the above
+                    update_topics = True
+
+            # Pause tasks and update topics synchronously if necessary
+            if update_topics:
+                logging.info("Updating topics...")
+                new_topics = self.extract_topics(
+                    self.unclassified_messages, extra_prompt=self.extra_prompt
+                )
+                self.topics += new_topics
+                print("new topics:", new_topics)
+                unclassified = self.unclassified_messages
+                self.unclassified_messages = []
+                self.process_batch(unclassified, self.max_parallel_calls)
+                logging.info(self.topic_counts)
+
+        # after we've finished classifying, rename the topics to reflect all the messages under them
+        t2m = self.topics_to_messages
+        for i, t in enumerate(copy.copy(self.topics)):
+            if t != "Other":
+                new_name = self.extract_topics(t2m[t])[0]
+                self.topics[i] = new_name
+
+        # Log topic counts after processing all messages
         logging.info(self.topic_counts)
 
-    def step(self, message: str):
-        if len(self.topics):
-            topic_num = self.classifier(self.topics, message, llm=self.classifier_llm)
-            assert topic_num <= len(self.topics)
-        else:
-            topic_num = 0
+    def process_batch(self, msg, n_jobs: int = 5):
+        def classify_message(message: str):
+            if len(self.topics):
+                topic_num = topic_classifier(
+                    self.topics, message, llm=self.classifier_llm
+                )
+                assert topic_num <= len(self.topics)
+            else:
+                topic_num = 0
 
-        if topic_num == 0:
-            self.unclassified_messages.append(message)
-        else:
-            self.messages_to_topics[message] = topic_num - 1
-            if self.verbose:
-                print(message, "\n", self.topics[topic_num - 1], "\n***********")
+            return topic_num
 
-        update_topics = False
-        if len(self.topics):
-            if len(self.unclassified_messages) > self.max_unclassified_messages:
-                update_topics = True
-        else:
-            if len(self.unclassified_messages) > self.initial_unclassified_messages:
-                update_topics = True
+        results = process_batch_parallel(
+            classify_message, [(m,) for m in msg], max_workers=n_jobs
+        )
 
-        if update_topics:
-            logging.info("Updating topics...")
-            self.update_topics()
-            logging.info(self.topic_counts)
-
-        return topic_num
+        for topic_num, (message,) in results:
+            if topic_num == 0:
+                self.unclassified_messages.append(message)
+            else:
+                self.messages_to_topics[message] = topic_num - 1
+                if self.verbose:
+                    print(message, "\n", self.topics[topic_num - 1], "\n***********")
 
     def update_topics(self):
         messages = self.unclassified_messages
@@ -112,15 +166,16 @@ class GreedyTopicExtractor:
         for m in messages:
             self.step(m)
 
-    def extract_topics(self, messages: Sequence[str]):
+    def extract_topics(self, messages: Sequence[str], extra_prompt: str | None = None):
         logging.info("updating topics...")
 
         num_topics = (
-            self.num_topics_per_pass if len(self.topics) else self.initial_num_topics
+            self.num_topics_per_update if len(self.topics) else self.initial_num_topics
         )
 
         topics = self.topic_extractor(
             messages,
+            extra_prompt=extra_prompt,
             n_topics=num_topics,
             with_count=True,
             max_words=self.max_words_in_topic,
@@ -146,11 +201,22 @@ class GreedyTopicExtractor:
 
 
 def greedy_topic_tree(messages, max_depth=0, **kwargs):
+
+    initial_topics = kwargs.pop("initial_topics", None)
+    assert initial_topics is None or isinstance(initial_topics, (list, tuple, dict))
+
     for key in ["max_unclassified_messages", "initial_unclassified_messages"]:
         if key in kwargs and kwargs[key] < 1:
             kwargs[key] = int(len(messages) * kwargs[key])
 
-    gte = GreedyTopicExtractor(**kwargs)
+    gte = GreedyTopicExtractor(
+        **kwargs,
+        initial_topics=(
+            list(initial_topics.keys())
+            if isinstance(initial_topics, dict)
+            else initial_topics
+        ),
+    )
     gte(messages)
     topic_tree = {}
     t2m = gte.topics_to_messages
@@ -167,12 +233,44 @@ def greedy_topic_tree(messages, max_depth=0, **kwargs):
     return topic_tree
 
 
-def tree_summary(x: dict):
+def cleanup(x: dict, min_topic_size: int = 5):
     x = deepcopy(x)
-    for k, v in x.items():
-        m = v.pop("messages")
-        if "sub-topics" in v:
-            x[k] = tree_summary(v["sub-topics"])
-        else:
-            x[k] = len(m)
+    # Collapse all the tiny topics into "Other"
+    if "Other" not in x:
+        x["Other"] = {"messages": []}
+
+    keys = list(x.keys())
+    for k in keys:
+        if k == "Other":
+            continue
+        if len(x[k]["messages"]) < min_topic_size:
+            tmp = x.pop(k)
+            x["Other"]["messages"] += tmp["messages"]
+
+    if not len(x["Other"]["messages"]):
+        x.pop("Other")
+
+    # TODO: Move all subtopics with just one topic one level up
+
     return x
+
+
+def tree_summary(x: dict, include_messages: bool = True, min_topic_size: int = 1):
+    x = cleanup(x, min_topic_size)
+    out = {}
+    for k, v in sorted(
+        list(x.items()), key=lambda x: len(x[1]["messages"]), reverse=True
+    ):
+        m = v["messages"]
+        new_k = f"{k} : {len(m)}"
+        if "sub-topics" in v:
+            out[new_k] = tree_summary(v["sub-topics"])
+        else:
+            out[new_k] = m if include_messages else ""
+
+    if "Other" in out:
+        # Move "other" to the end
+        tmp = out.pop("Other")
+        out["Other"] = tmp
+        print("yay!")
+    return out

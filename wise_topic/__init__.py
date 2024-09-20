@@ -3,3 +3,4 @@ from wise_topic.classifier.classifier import (
     llm_classifier_binary,
     llm_classifier_multiple,
 )
+from wise_topic.drilldown_tree import display_drilldown
